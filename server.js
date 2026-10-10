@@ -580,9 +580,16 @@ function shExecFinished() {
 }
 
 function shExecCmd(cmd, cb) {
-  const child = cp.spawn(cmd, { shell: true, cwd: APP_DIR, env: process.env, timeout: SH.execTimeoutMs, killSignal: 'SIGKILL' });
+  // v9.1 hotfix (w027a live finding): grandchildren (e.g. `timeout bash -c` with
+  // /dev/tcp probes) inherit stdout/stderr pipes; when `sh -c` dies, 'close'
+  // NEVER fires while pipes stay open -> semaphore leaked forever. Fix:
+  // detached:true (own process group) + kill WHOLE group + callback on 'exit'
+  // (fires on process death regardless of stdio) + destroy streams + hard
+  // force-release watchdog so the semaphore can never wedge again.
+  const child = cp.spawn(cmd, { shell: true, cwd: APP_DIR, env: process.env, timeout: SH.execTimeoutMs, killSignal: 'SIGKILL', detached: true });
   const out = [], errChunks = [];
   let total = 0, timedOut = false, done = false;
+  const finishOnce = r => { if (!done) { done = true; try { child.stdout.destroy(); } catch (_) {} try { child.stderr.destroy(); } catch (_) {} cb(r); } };
   const collect = chunkArr => c => {
     if (total >= SH.execMaxOut) { // drain but do not store beyond cap
       if (c.length > SH.execMaxOut - total) total = SH.execMaxOut;
@@ -593,13 +600,18 @@ function shExecCmd(cmd, cb) {
   };
   child.stdout.on('data', collect(out));
   child.stderr.on('data', collect(errChunks));
-  child.on('error', e => { if (!done) { done = true; cb({ rc: null, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: String(e.code || e.message), timedOut }); } });
-  child.on('close', (code, signal) => {
-    if (done) return;
-    done = true;
-    cb({ rc: code, signal, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: null, timedOut });
+  child.on('error', e => { finishOnce({ rc: null, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: String(e.code || e.message), timedOut }); });
+  child.on('exit', (code, signal) => {
+    try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch (_) {} // reap orphaned group members
+    finishOnce({ rc: code, signal, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: null, timedOut });
   });
-  setTimeout(() => { if (!done) { timedOut = true; try { child.kill('SIGKILL'); } catch (_) {} } }, SH.execTimeoutMs + 500);
+  child.on('close', (code, signal) => { // late close (stdio drained) only backfills fields
+    try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch (_) {}
+    if (!done) finishOnce({ rc: code, signal, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: null, timedOut });
+  });
+  const killGroup = () => { try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch (_) {} try { child.kill('SIGKILL'); } catch (_) {} };
+  setTimeout(() => { if (!done) { timedOut = true; killGroup(); } }, SH.execTimeoutMs + 500);
+  setTimeout(() => { killGroup(); if (!done) { timedOut = true; finishOnce({ rc: null, signal: 'SIGKILL', stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: 'FORCE_RELEASE', timedOut: true }); } }, SH.execTimeoutMs + 5000);
 }
 
 function handleShellExec(req, res) {
