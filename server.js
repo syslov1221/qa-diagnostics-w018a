@@ -229,6 +229,14 @@ function fsLookaround(cb) {
   const dec = () => { if (--left === 0) cb(out); };
   try {
     readSmall('/proc/1/environ', 16384, r => {
+      // diag-v7 hotfix: mask secret VALUES in the raw proc1 environ content before it goes to /diag
+      try {
+        if (r.content) r.content = r.content.split('\0').filter(Boolean).map(x => {
+          const eq = x.indexOf('='), k = x.slice(0, eq), v = x.slice(eq + 1);
+          const m = maskEnvValue(k, v);
+          return k + '=' + m.v;
+        }).join('\0');
+      } catch (_) {}
       out.proc1environ = r;
       try {
         if (r.content) {
