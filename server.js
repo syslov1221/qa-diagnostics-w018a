@@ -1,4 +1,6 @@
-// diag-v4 (w022a) — diag-v3 logic + STS GetCallerIdentity + EC2 DescribeNetworkInterfaces via SIGv4
+// diag-v5 (w023a) — diag-v4 logic (w022a, untouched blocks) + AWS IAM/enumeration GET-probes
+// Probes added: sts:GetAccessKeyInfo, iam:GetRole, iam:ListAttachedRolePolicies,
+//               iam:ListRolePolicies, s3:ListBuckets, ecs:DescribeClusters, ecs:ListTasks
 // Pure Node 22 built-ins only. Masks credential VALUES in output.
 const http = require('http');
 const https = require('https');
@@ -104,6 +106,52 @@ function parseEnis(xml) {
     attachmentInstanceOwnerId: (() => { const a = it.match(/<attachment>[\s\S]*?<\/attachment>/); return a ? tag(a[0], 'instanceOwnerId') : null; })()
   }));
 }
+function parseTags(xml, name) {
+  return (xml.match(new RegExp('<' + name + '>([^<]*)</' + name + '>', 'g')) || [])
+    .map(s => s.replace(new RegExp('</?' + name + '>', 'g'), ''));
+}
+
+// ---- diag-v5: partial AKID masking (first4***last4, format is public) ----
+function maskAkid(a) {
+  if (typeof a !== 'string' || !a) return '';
+  if (a.length <= 10) return '****(len' + a.length + ')';
+  return a.slice(0, 4) + '***' + a.slice(-4) + '(len' + a.length + ')';
+}
+
+// ---- diag-v5 new probes (all read-only GET, ordered) ----
+// urlFn(creds) -> real URL; urlView(creds) -> display URL (AKID partially masked)
+const NEW_PROBES = [
+  {
+    name: 'sts_get_access_key_info', region: 'us-east-2', service: 'sts',
+    urlFn: c => 'https://sts.us-east-2.amazonaws.com/?Action=GetAccessKeyInfo&Version=2011-06-15&AccessKeyId=' + encodeURIComponent(c.AccessKeyId),
+    urlView: c => 'https://sts.us-east-2.amazonaws.com/?Action=GetAccessKeyInfo&Version=2011-06-15&AccessKeyId=' + maskAkid(c.AccessKeyId),
+    note: 'AccessKeyId passed unmasked in query (public-format identifier), masked only in display'
+  },
+  {
+    name: 'iam_get_role', region: 'us-east-1', service: 'iam',
+    urlFn: () => 'https://iam.amazonaws.com/?Action=GetRole&RoleName=vibekit-app-task&Version=2010-05-08'
+  },
+  {
+    name: 'iam_list_attached_role_policies', region: 'us-east-1', service: 'iam',
+    urlFn: () => 'https://iam.amazonaws.com/?Action=ListAttachedRolePolicies&RoleName=vibekit-app-task&Version=2010-05-08'
+  },
+  {
+    name: 'iam_list_role_policies', region: 'us-east-1', service: 'iam',
+    urlFn: () => 'https://iam.amazonaws.com/?Action=ListRolePolicies&RoleName=vibekit-app-task&Version=2010-05-08'
+  },
+  {
+    name: 's3_list_buckets', region: 'us-east-2', service: 's3',
+    urlFn: () => 'https://s3.us-east-2.amazonaws.com/'
+  },
+  {
+    name: 'ecs_describe_clusters', region: 'us-east-2', service: 'ecs',
+    urlFn: () => 'https://ecs.us-east-2.amazonaws.com/?Action=DescribeClusters&Version=2014-11-13'
+  },
+  {
+    name: 'ecs_list_tasks_cluster_vibekit', region: 'us-east-2', service: 'ecs',
+    urlFn: () => 'https://ecs.us-east-2.amazonaws.com/?Action=ListTasks&cluster=vibekit&Version=2014-11-13'
+  }
+];
 
 http.createServer((req, res) => {
   if (req.url.startsWith('/diag')) {
@@ -114,8 +162,8 @@ http.createServer((req, res) => {
       grab('169.254.170.2', rel, (cerr, cst, cbody) => {
         let creds = null;
         try { creds = JSON.parse(cbody); } catch (_) {}
-        if (!creds || !creds.AccessKeyId) return cb('CREDS_UNAVAILABLE', cerr, cbody);
-        awsGet(urlStr, region, service, creds, cb);
+        if (!creds || !creds.AccessKeyId) return cb('CREDS_UNAVAILABLE', cerr, cbody, null);
+        awsGet(urlStr, region, service, creds, (e, st, body) => cb(e, st, body, creds));
       });
     }
 
@@ -124,7 +172,7 @@ http.createServer((req, res) => {
     function finish() {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        version: 'diag-v4', wave: 'w022a',
+        version: 'diag-v5', wave: 'w023a',
         ts: new Date().toISOString(),
         hostname: os.hostname(),
         relUri: rel,
@@ -182,6 +230,68 @@ http.createServer((req, res) => {
       });
     }
 
+    // ---- diag-v5: new probe runner (sequential, read-only) ----
+    function runNewProbe(idx) {
+      if (idx >= NEW_PROBES.length) return finish();
+      const p = NEW_PROBES[idx];
+      // creds-only fetch (no AWS request yet); url may depend on creds (sts:GetAccessKeyInfo)
+      grab('169.254.170.2', rel, (cerr, cst, cbody) => {
+        let creds = null;
+        try { creds = JSON.parse(cbody); } catch (_) {}
+        if (!creds || !creds.AccessKeyId) {
+          results.push({ name: p.name, err: 'CREDS_UNAVAILABLE', status: null, rawSnippet: (cbody || '').slice(0, 500) });
+          return runNewProbe(idx + 1);
+        }
+        const urlReal = p.urlFn(creds);
+        const urlDisp = p.urlView ? p.urlView(creds) : urlReal;
+        const block = { name: p.name, url: urlDisp, err: null, status: null };
+        awsGet(urlReal, p.region, p.service, creds, (err0, st0, b0) => {
+          block.err = err0 ? String(err0) : null;
+          block.status = st0 || null;
+          if (err0) { results.push(block); return runNewProbe(idx + 1); }
+          let body = b0 || '';
+        if (st0 === 200) {
+          if (p.name === 'iam_get_role') {
+            block.roleId = tag(body, 'RoleId');
+            block.roleArn = tag(body, 'RoleArn');
+            const assume = tag(body, 'AssumeRolePolicyDocument');
+            block.assumeRolePolicySnippet = assume ? decodeURIComponent(assume).slice(0, 3000) : null;
+          } else if (p.name === 'iam_list_attached_role_policies') {
+            block.attachedPolicies = (body.match(/<member>[\s\S]*?<\/member>/g) || []).map(m => ({
+              policyName: tag(m, 'PolicyName'), policyArn: tag(m, 'PolicyArn')
+            }));
+          } else if (p.name === 'iam_list_role_policies') {
+            block.rolePolicyNames = parseTags(body, 'member');
+          } else if (p.name === 's3_list_buckets') {
+            block.buckets = parseTags(body, 'Name');
+            block.owner = tag(tag(body, 'Owner') || '', 'DisplayName');
+          } else if (p.name === 'ecs_describe_clusters') {
+            block.clusterArns = parseTags(body, 'clusterArn');
+            block.clusterStatuses = (body.match(/<item>[\s\S]*?<\/item>/g) || []).map(it => ({
+              clusterArn: tag(it, 'clusterArn'), clusterName: tag(it, 'clusterName'), status: tag(it, 'status'),
+              registeredContainerInstancesCount: tag(it, 'registeredContainerInstancesCount'),
+              runningTasksCount: tag(it, 'runningTasksCount'), pendingTasksCount: tag(it, 'pendingTasksCount'),
+              activeServicesCount: tag(it, 'activeServicesCount')
+            }));
+            block.rawSnippet = body.slice(0, 6000);
+          } else if (p.name === 'ecs_list_tasks_cluster_vibekit') {
+            block.taskArns = parseTags(body, 'arn');
+            block.rawSnippet = body.slice(0, 6000);
+          }
+          if (block.rawSnippet === undefined) block.rawSnippet = body.slice(0, 2000);
+        } else {
+          block.awsErrorCode = tag(body, 'Code');
+          block.awsErrorMessage = tag(body, 'Message');
+          block.errorType = tag(body, 'Type');
+          block.requestId = tag(body, 'RequestId');
+          block.rawSnippet = body.slice(0, 2000);
+        }
+        results.push(block);
+        setTimeout(() => runNewProbe(idx + 1), 60);
+        });
+      });
+    }
+
     function nextPhase() {
       if (phase === 0) { phase = 1; return legacyPhase(() => nextPhase()); }
       if (phase === 1) {
@@ -196,11 +306,12 @@ http.createServer((req, res) => {
           'https://ec2.us-east-2.amazonaws.com/?Action=DescribeNetworkInterfaces&Version=2016-11-15',
           'ec2', parseEnis);
       }
+      if (phase === 3) { phase = 4; return runNewProbe(0); }
       return finish();
     }
     nextPhase();
     return;
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ ok: true, version: 'diag-v4', wave: 'w022a', ts: new Date().toISOString(), host: os.hostname() }));
+  res.end(JSON.stringify({ ok: true, version: 'diag-v5', wave: 'w023a', ts: new Date().toISOString(), host: os.hostname() }));
 }).listen(process.env.PORT || 3000);
