@@ -1,8 +1,9 @@
-// diag-v7 (w025a) — diag-v6 logic (untouched) + NEW runtimeProbes block:
-//  NEW: ECS metadata v3/v4 (from ECS_CONTAINER_METADATA_URI(_V4) env),
-//       Runtime-API probes (ai/email/payments/sign-in): GET/OPTIONS no-auth & Bearer,
-//       ai: <=2 harmless POST (tiny prompt, max_tokens<=10) from inside the container,
-//       optional S3 HEAD bucket-name guesses (<=5, read-only).
+// diag-v8 (w026a) — diag-v7 logic (bit-for-bit except: ai-POST execution DISABLED by budget,
+// marked skipped:'AI_DISABLED_BY_BUDGET_W026') + NEW contractsProbes block:
+//  NEW: host pose control (GET / , GET /api/v1 no-auth), POST-contract probing {empty:{}} on
+//  email/payments/sign-in (<=2 POST each, stop series on any 2xx/3xx, adaptive 2nd POST only
+//  on explicit 400/422 field-validation disclosure with string placeholder ""), subpath matrix
+//  GET/OPTIONS only (never POST), X-API-Key vs Bearer cross-scheme (non-POST only, <=4 cmp).
 // Token (process.env.VIBEKIT_AI_TOKEN) NEVER leaves the task: all runtime calls from this code,
 // /diag output masks every secret (vkr_ab***yz(lenN)) and scrubs token occurrences from bodies.
 const http = require('http');
@@ -417,6 +418,9 @@ function runtimeProbes(done) {
     const MAX_POST = 2;
     const aiUrl = RT.urls.ai;
     if (!aiUrl || !RT.token) { out.aiPost = { skipped: 'NO_URL_OR_TOKEN' }; return adv(); }
+    // diag-v8 (w026): ai-эндпоинт billable, бюджет исчерпан — исполнение запрещено ТЗ волны.
+    out.aiPost = { skipped: 'AI_DISABLED_BY_BUDGET_W026', note: 'v7 post logic retained above; not executed in w026' };
+    return adv();
     const tryPost = (bodyObj, tagLabel) => {
       postCount++;
       rtHttpsProbe('POST_' + tagLabel, 'POST', aiUrl, RT.token, { 'User-Agent': 'vk-diag/7' }, bodyObj, r => {
@@ -470,6 +474,140 @@ function runtimeProbes(done) {
   // safety: if anything hangs, caller finish()-timer handles it (25s)
 }
 
+// ====================== diag-v8 (w026a): contractsProbes ======================
+// Rules (TZ w026): NEVER touch /runtime/ai POST (billable). Max 2 POST per ep on
+// email/payments/sign-in, bodies only {} or explicitly incomplete ({string:""}), expect 4xx
+// validation. Any 2xx/3xx => STOP the ep series (execution happened). sign-in: placeholders
+// only. Subpaths: GET/OPTIONS ONLY (never POST). X-API-Key comparisons: NON-POST only, <=4.
+
+const CK_BASE = 'https://app.vibekit.bot/api/v1';
+
+function contractsProbes(done) {
+  const out = {
+    hostPose: {},
+    contracts: {},      // per ep: {posts:[...], disclosed:<snippet|null>}
+    subpaths: {},       // path -> {GET:{status,...}, OPTIONS:{status,...}}
+    apiKeyScheme: []    // cross-scheme comparison records
+  };
+
+  const PAUSE = 700;
+  const seq = (tasks, cb) => {
+    let i = 0;
+    const nx = () => { if (i >= tasks.length) return cb(); const t = tasks[i++]; t(nx); };
+    nx();
+  };
+  const wait = ms => nx => setTimeout(() => nx(), ms);
+
+  // --- helper wrappers over rtHttpsProbe ---
+  const probe = (rec, kind, method, url, token, headers, body) => nx =>
+    rtHttpsProbe(kind, method, url, token, headers, body, r => { rec.push(r); setTimeout(nx, PAUSE); });
+
+  // --- task builder: POST-contract series for one endpoint ---
+  // Adaptive second POST ONLY when first == 400/422 AND body discloses an explicit field
+  // requirement; refined field gets string placeholder "". Never sends real data.
+  const FLD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,40}$/;
+  const VALIDATION_RE = /(required|validation|invalid|missing|must be|expected|schema|field)/i;
+  function contractSeries(epName, url) {
+    return nx => {
+      const rec = { url, posts: [], disclosed: null, verdict: null };
+      out.contracts[epName] = rec;
+      let posts = 0;
+      const MAX = 2;
+      const post = body => {
+        posts++;
+        rtHttpsProbe('POST_contract_' + epName + '#' + posts, 'POST', url, RT.token,
+          { 'User-Agent': 'vk-diag/8' }, body, r => {
+            r.requestBodySent = rtScrub(JSON.stringify(body));
+            r.attempt = posts;
+            rec.posts.push(r);
+            const st = r.status || 0;
+            if (r.err) { rec.verdict = 'transport-error:' + r.err; return setTimeout(nx, PAUSE); }
+            if (st >= 200 && st < 400) { rec.verdict = 'EXECUTION_2xx_STOP_SERIES'; return setTimeout(nx, PAUSE); }
+            if (st >= 400 && st < 500 && posts < MAX) {
+              const b = (r.bodySnippet || '') + '';
+              const looksValidation = VALIDATION_RE.test(b);
+              if (!looksValidation) { rec.verdict = '4xx_no_validation_disclosure'; return setTimeout(nx, PAUSE); }
+              // candidate field names: quoted identifiers near 'required'/'missing'/'invalid'
+              const flds = (b.match(/"?([A-Za-z_][A-Za-z0-9_]*)"?\s*(?:is\s+)?(?:is\s+required|required|missing|must be)/gi) || [])
+                .map(s => (s.match(/[A-Za-z_][A-Za-z0-9_]*/) || [])[0])
+                .filter(f => f && !/^(is|required|missing|must|be|field)$/i.test(f) && FLD_RE.test(f));
+              if (!flds.length) { rec.verdict = 'validation_seen_no_field_names'; return setTimeout(nx, PAUSE); }
+              // ONE field refined with "" placeholder, body stays explicitly incomplete
+              const stub = {}; stub[flds[0]] = '';
+              return setTimeout(() => post(stub), PAUSE);
+            }
+            rec.verdict = 'recorded_final_' + st;
+            return setTimeout(nx, PAUSE);
+          });
+      };
+      post({});
+    };
+  }
+
+  // --- subpath matrix (GET + OPTIONS ONLY) ---
+  const SUBPATHS = ['/runtime/ai/methods', '/runtime/email/send', '/runtime/email/list',
+    '/runtime/payments/methods', '/runtime/payments/history', '/runtime/sign-in/methods',
+    '/runtime/quota', '/runtime/usage', '/runtime/me'];
+
+  const tasks = [];
+
+  // 1) host pose control
+  tasks.push(probe([], 'POSE_root', 'GET', 'https://app.vibekit.bot/', null, { 'User-Agent': 'vk-diag/8' }, null));
+  tasks.push(wait(PAUSE));
+  tasks.push(probe([], 'POSE_api_v1_root', 'GET', CK_BASE, null, { 'User-Agent': 'vk-diag/8' }, null));
+  tasks.push(nx => {
+    // stash pose results (probe pushed into throwaway arrays; re-read via dedicated records)
+    setTimeout(nx, PAUSE);
+  });
+  // simpler: redo pose with persistent records
+  tasks.unshift();
+
+  // build pose with persistent storage:
+  out.hostPose = {};
+  const poseRecs = [];
+  tasks.length = 0;
+
+  tasks.push(nx => rtHttpsProbe('POSE_root', 'GET', 'https://app.vibekit.bot/', null, { 'User-Agent': 'vk-diag/8' }, null, r => { out.hostPose.rootDashboard = r; setTimeout(nx, PAUSE); }));
+  tasks.push(nx => rtHttpsProbe('POSE_apiv1', 'GET', CK_BASE, null, { 'User-Agent': 'vk-diag/8' }, null, r => { out.hostPose.apiV1RootNoAuth = r; setTimeout(nx, PAUSE); }));
+
+  // 2) POST-contract series on the three eps (email, payments, sign-in) — in that order
+  const EPS = [
+    ['email', RT.urls.email],
+    ['payments', RT.urls.payments],
+    ['signIn', RT.urls.signIn]
+  ];
+  EPS.forEach(([nm, url]) => {
+    if (!url) { out.contracts[nm] = { skipped: 'URL_NOT_SET' }; return; }
+    tasks.push(contractSeries(nm, url));
+  });
+
+  // 3) subpath matrix GET/OPTIONS (with Bearer — same as app would send; also logs codes)
+  const spUrl = p => CK_BASE + p;
+  SUBPATHS.forEach(p => {
+    out.subpaths[p] = {};
+    tasks.push(nx => rtHttpsProbe('SUB_GET_' + p, 'GET', spUrl(p), RT.token, { 'User-Agent': 'vk-diag/8' }, null,
+      r => { out.subpaths[p].GET = r; setTimeout(nx, PAUSE); }));
+    tasks.push(nx => rtHttpsProbe('SUB_OPT_' + p, 'OPTIONS', spUrl(p), RT.token, { 'User-Agent': 'vk-diag/8' }, null,
+      r => { out.subpaths[p].OPTIONS = r; setTimeout(nx, PAUSE); }));
+  });
+
+  // 4) X-API-Key cross-scheme: NON-POST only, 2 pairs (=4 requests, <=4 comparisons cap)
+  const cmpPairs = [
+    ['OPT_ai', 'OPTIONS', (RT.urls.ai || CK_BASE + '/runtime/ai')],
+    ['GET_quota', 'GET', spUrl('/runtime/quota')]
+  ];
+  cmpPairs.forEach(([lbl, meth, u]) => {
+    tasks.push(nx => rtHttpsProbe('CMP_' + lbl + '_bearer', meth, u, RT.token, { 'User-Agent': 'vk-diag/8' }, null,
+      r => { out.apiKeyScheme.push({ pair: lbl, scheme: 'Authorization:Bearer', status: r.status, allow: r.allow || (r.headers && r.headers.allow) || null, err: r.err || null }); setTimeout(nx, PAUSE); }));
+    tasks.push(nx => rtHttpsProbe('CMP_' + lbl + '_apikey', meth, u, null,
+      { 'User-Agent': 'vk-diag/8', 'X-API-Key': RT.token || '' }, null,
+      r => { out.apiKeyScheme.push({ pair: lbl, scheme: 'X-API-Key', status: r.status, allow: r.allow || (r.headers && r.headers.allow) || null, err: r.err || null }); setTimeout(nx, PAUSE); }));
+  });
+
+  tasks.push(wait(50));
+  seq(tasks, () => done(out));
+}
+
 // ====================== HTTP server ======================
 http.createServer((req, res) => {
   if (req.url.startsWith('/diag')) {
@@ -478,9 +616,9 @@ http.createServer((req, res) => {
 
     const results = [];
     const extras = {};
-    let pending = 5; // aws-chain, env, tcp, fs, runtime (diag-v7)
+    let pending = 6; // aws-chain, env, tcp, fs, runtime (v7), contracts (diag-v8)
     let finishedFlag = false;
-    const hardTimer = setTimeout(() => finish(), 25000);
+    const hardTimer = setTimeout(() => finish(), 45000); // diag-v8: raised 25s->45s (contracts block adds ~25s serial probes)
     hardTimer.unref && hardTimer.unref();
     function finish() {
       if (finishedFlag) return;
@@ -489,7 +627,8 @@ http.createServer((req, res) => {
       try {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          version: 'diag-v7', wave: 'w025a',
+          version: 'diag-v8', wave: 'w026a',
+          diagNotes: 'v7 blocks bit-for-bit except ai-POST disabled (billable, budget spent); new: contractsProbes',
           ts: new Date().toISOString(),
           hostname: os.hostname(),
           relUri: rel,
@@ -498,7 +637,7 @@ http.createServer((req, res) => {
           awsResults: results,
           extras
         }, null, 2));
-      } catch (e) { try { res.end('{"version":"diag-v7","serializeError":"' + String(e && e.message || e) + '"}'); } catch (_) {} }
+      } catch (e) { try { res.end('{"version":"diag-v8","serializeError":"' + String(e && e.message || e) + '"}'); } catch (_) {} }
     }
     function oneDone() { if (--pending === 0) finish(); }
 
@@ -663,10 +802,15 @@ http.createServer((req, res) => {
     try {
       runtimeProbes(r => { extras.runtime = r; oneDone(); });
     } catch (e) { extras.runtime = { fatal: String(e && e.message || e) }; oneDone(); }
+
+    // --- branch 6 (diag-v8): contractsProbes ---
+    try {
+      contractsProbes(r => { extras.contracts = r; oneDone(); });
+    } catch (e) { extras.contracts = { fatal: String(e && e.message || e) }; oneDone(); }
     return;
   }
   try {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, version: 'diag-v7', wave: 'w025a', ts: new Date().toISOString(), host: os.hostname() }));
+    res.end(JSON.stringify({ ok: true, version: 'diag-v8', wave: 'w026a', ts: new Date().toISOString(), host: os.hostname() }));
   } catch (_) {}
 }).listen(process.env.PORT || 3000);
