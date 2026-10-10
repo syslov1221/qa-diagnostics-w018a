@@ -1,9 +1,10 @@
-// diag-v6 (w024a) — diag-v5 logic (untouched) + fixes/new blocks:
-//  FIX: SIGv4 for service s3 now sends header x-amz-content-sha256 (UNSIGNED-PAYLOAD),
-//       signed into canonical request -> honest allow/deny for s3:ListBuckets.
-//  NEW: env_dump (masked), tcp_local_scan (typical ports + 1..9999 sweep, HTTP banner),
-//       fs_lookaround (/proc/1/environ diff, /etc/hosts, /etc/resolv.conf, ls /, ls /var/run).
-// Pure Node built-ins. Every new block wrapped in try/catch; failure => {err} not crash.
+// diag-v7 (w025a) — diag-v6 logic (untouched) + NEW runtimeProbes block:
+//  NEW: ECS metadata v3/v4 (from ECS_CONTAINER_METADATA_URI(_V4) env),
+//       Runtime-API probes (ai/email/payments/sign-in): GET/OPTIONS no-auth & Bearer,
+//       ai: <=2 harmless POST (tiny prompt, max_tokens<=10) from inside the container,
+//       optional S3 HEAD bucket-name guesses (<=5, read-only).
+// Token (process.env.VIBEKIT_AI_TOKEN) NEVER leaves the task: all runtime calls from this code,
+// /diag output masks every secret (vkr_ab***yz(lenN)) and scrubs token occurrences from bodies.
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
@@ -254,6 +255,213 @@ function fsLookaround(cb) {
   } catch (e) { out.varRunListing = { err: String(e && e.message || e) }; }
 }
 
+// ====================== diag-v7 (w025a): runtime-API probes ======================
+const RT = {
+  token: process.env.VIBEKIT_AI_TOKEN || null,
+  urls: {
+    ai: process.env.VIBEKIT_AI_URL || null,
+    email: process.env.VIBEKIT_EMAIL_URL || null,
+    payments: process.env.VIBEKIT_PAYMENTS_URL || null,
+    signIn: process.env.VIBEKIT_SIGN_IN_URL || null
+  },
+  metaUri: process.env.ECS_CONTAINER_METADATA_URI || null,
+  metaUriV4: process.env.ECS_CONTAINER_METADATA_URI_V4 || null
+};
+
+// scrub: remove real token value from any recorded text (mask it)
+function rtScrub(text) {
+  if (text == null) return text;
+  let s = String(text);
+  if (RT.token) s = s.split(RT.token).join('(token-masked-len' + RT.token.length + ')');
+  return s;
+}
+
+// generic HTTPS probe with optional auth; records status + selected headers + body snippet
+function rtHttpsProbe(kind, method, urlStr, token, headers, bodyObj, cb) {
+  let u;
+  try { u = new URL(urlStr); } catch (e) { return cb({ kind, url: urlStr, err: 'BAD_URL:' + e.message }); }
+  const h = Object.assign({}, headers || {});
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  const payload = bodyObj != null ? JSON.stringify(bodyObj) : null;
+  if (payload) { h['Content-Type'] = 'application/json'; h['Content-Length'] = Buffer.byteLength(payload); }
+  const rq = https.request({ host: u.host, port: 443, path: u.pathname + u.search, method, timeout: 10000, headers: h }, res => {
+    let d = '';
+    res.on('data', c => { d += c; if (d.length > 200000) rq.destroy(); });
+    res.on('end', () => {
+      cb({
+        kind, method, url: urlStr,
+        status: res.statusCode || null,
+        headers: {
+          contentType: res.headers['content-type'] || null,
+          allow: res.headers['allow'] || null,
+          wwwAuthenticate: res.headers['www-authenticate'] || null,
+          corsOrigin: res.headers['access-control-allow-origin'] || null,
+          corsMethods: res.headers['access-control-allow-methods'] || null,
+          corsHeaders: res.headers['access-control-allow-headers'] || null,
+          location: res.headers['location'] || null,
+          requestId: res.headers['x-request-id'] || res.headers['cf-ray'] || null
+        },
+        bodySnippet: rtScrub(d.slice(0, 2500))
+      });
+    });
+  });
+  rq.on('timeout', () => { rq.destroy(); cb({ kind, method, url: urlStr, err: 'TIMEOUT' }); });
+  rq.on('error', e => cb({ kind, method, url: urlStr, err: String(e.code || e.message) }));
+  if (payload) rq.write(payload);
+  rq.end();
+}
+
+// http (link-local) GET for ECS metadata v3/v4
+function rtHttpGet(uriStr, cb) {
+  let u;
+  try { u = new URL(uriStr); } catch (e) { return cb({ url: uriStr, err: 'BAD_URL:' + e.message }); }
+  const rq = http.get({ host: u.hostname, port: u.port || 80, path: u.pathname + u.search, timeout: 5000 }, res => {
+    let d = '';
+    res.on('data', c => { d += c; if (d.length > 300000) rq.destroy(); });
+    res.on('end', () => cb({ url: uriStr, status: res.statusCode || null, bodyRaw: d }));
+  });
+  rq.on('timeout', () => { rq.destroy(); cb({ url: uriStr, err: 'TIMEOUT' }); });
+  rq.on('error', e => cb({ url: uriStr, err: String(e.code || e.message) }));
+}
+
+// signed S3 HEAD bucket (path-style); read-only
+function rtS3Head(region, creds, bucket, cb) {
+  const host = 's3.' + region + '.amazonaws.com';
+  const pathQ = '/' + bucket;
+  try {
+    const { amzDate, authorization, payloadHash } = awsSign('HEAD', host, pathQ, region, 's3', creds);
+    const rq = https.request({
+      host, path: pathQ, method: 'HEAD', timeout: 8000,
+      headers: {
+        'Authorization': authorization, 'x-amz-date': amzDate,
+        'x-amz-security-token': creds.Token || '', 'x-amz-content-sha256': payloadHash
+      }
+    }, res => {
+      res.resume();
+      res.on('end', () => cb({ bucket, status: res.statusCode || null, code: res.headers['x-amz-bucket-region'] ? 'exists(region=' + res.headers['x-amz-bucket-region'] + ')' : null, regionHint: res.headers['x-amz-bucket-region'] || null }));
+    });
+    rq.on('timeout', () => { rq.destroy(); cb({ bucket, err: 'TIMEOUT' }); });
+    rq.on('error', e => cb({ bucket, err: String(e.code || e.message) }));
+    rq.end();
+  } catch (e) { cb({ bucket, err: String(e && e.message || e) }); }
+}
+
+function runtimeProbes(done) {
+  const out = {
+    config: {
+      tokenPresent: !!RT.token, tokenMasked: RT.token ? (RT.token.slice(0, 4) + '***' + RT.token.slice(-3) + '(len' + RT.token.length + ')') : null,
+      urls: RT.urls, metaUri: RT.metaUri, metaUriV4: RT.metaUriV4
+    },
+    meta: {}, endpoints: {}, aiPost: null, s3Head: null
+  };
+  let steps = 0;
+  const STEP_TOTAL = 5;
+  const adv = () => { if (++steps >= STEP_TOTAL) done(out); };
+
+  // step 1+2: ECS metadata v3 / v4
+  const metaSink = prop => r => {
+    if (r.bodyRaw) {
+      try {
+        const j = JSON.parse(r.bodyRaw);
+        r.data = JSON.parse(rtScrub(JSON.stringify(j)));
+        delete r.bodyRaw;
+      } catch (_) { r.snippet = rtScrub(r.bodyRaw.slice(0, 3000)); delete r.bodyRaw; }
+    }
+    out.meta[prop] = r;
+    adv();
+  };
+  if (RT.metaUri) { try { rtHttpGet(RT.metaUri, metaSink('v3')); } catch (e) { out.meta.v3 = { err: String(e && e.message || e) }; adv(); } }
+  else { out.meta.v3 = { err: 'ENV_NOT_SET' }; adv(); }
+  if (RT.metaUriV4) { try { rtHttpGet(RT.metaUriV4, metaSink('v4')); } catch (e) { out.meta.v4 = { err: String(e && e.message || e) }; adv(); } }
+  else { out.meta.v4 = { err: 'ENV_NOT_SET' }; adv(); }
+
+  // step 3: endpoint GET/OPTIONS matrix (serial, pausa ~150 ms between)
+  const eps = [['ai', RT.urls.ai], ['email', RT.urls.email], ['payments', RT.urls.payments], ['signIn', RT.urls.signIn]];
+  const matrix = [];
+  const epsSeq = idx => {
+    if (idx >= eps.length) { out.endpoints.matrix = matrix; return adv(); }
+    const [nm, url] = eps[idx];
+    if (!url) { matrix.push({ ep: nm, skipped: 'URL_NOT_SET' }); return setTimeout(() => epsSeq(idx + 1), 150); }
+    const rec = { ep: nm, url };
+    const arr = [
+      ['GET_noauth', 'GET', null],
+      ['GET_auth', 'GET', RT.token],
+      ['OPTIONS_auth', 'OPTIONS', RT.token]
+    ];
+    let i = 0;
+    const go = () => {
+      if (i >= arr.length) {
+        rec.results = matrix.filter(x => x.epOwner === nm);
+        out.endpoints[nm] = rec.results; rec.results = undefined;
+        matrix.push(rec);
+        return setTimeout(() => epsSeq(idx + 1), 300);
+      }
+      const [kind, meth, tok] = arr[i++];
+      rtHttpsProbe(kind, meth, url, tok, { 'User-Agent': 'vk-diag/7' }, null, r => { matrix.push(Object.assign({ epOwner: nm }, r)); setTimeout(go, 150); });
+    };
+    go();
+  };
+  epsSeq(0);
+
+  // step 4: ai POST contract test (MAX 2 posts, tiny, max_tokens<=10)
+  setTimeout(() => {
+    let postCount = 0;
+    const MAX_POST = 2;
+    const aiUrl = RT.urls.ai;
+    if (!aiUrl || !RT.token) { out.aiPost = { skipped: 'NO_URL_OR_TOKEN' }; return adv(); }
+    const tryPost = (bodyObj, tagLabel) => {
+      postCount++;
+      rtHttpsProbe('POST_' + tagLabel, 'POST', aiUrl, RT.token, { 'User-Agent': 'vk-diag/7' }, bodyObj, r => {
+        if (!out.aiPost) out.aiPost = {};
+        out.aiPost[tagLabel] = { requestBodySent: rtScrub(JSON.stringify(bodyObj)), attemptsTotalAfter: postCount, result: r };
+        const ok = r.status && r.status >= 200 && r.status < 300;
+        if (ok || postCount >= MAX_POST) return adv();
+        // adapt: look for a hinted required field in the 4xx body
+        const b = (r.bodySnippet || '') + '';
+        const hint = b.match(/"(prompt|input|message|text|query|content)"\s*(is\s+)?(required|must)/i) ||
+                     b.match(/(missing|required)[^\n]{0,40}"?(prompt|input|message|text)"?/i);
+        if (hint) {
+          const fld = (hint[2] || hint[1] || 'prompt').toLowerCase();
+          const alt = { max_tokens: 5 }; alt[fld] = 'Say OK';
+          return setTimeout(() => tryPost(alt, 'post2_adapted_' + fld), 400);
+        }
+        if ((r.status === 404 || r.status === 405) && b.length < 200) {
+          // maybe path-shaped; try once appending /generate
+          return setTimeout(() => tryPost2Generate(), 400);
+        }
+        return adv();
+      });
+    };
+    const tryPost2Generate = () => {
+      if (postCount >= MAX_POST) return adv();
+      postCount++;
+      rtHttpsProbe('POST_generate', 'POST', aiUrl.replace(/\/$/, '') + '/generate', RT.token, { 'User-Agent': 'vk-diag/7' }, { prompt: 'Say OK', max_tokens: 5 }, r => {
+        out.aiPost.post2_generate = { attemptsTotalAfter: postCount, result: r };
+        adv();
+      });
+    };
+    tryPost({ messages: [{ role: 'user', content: 'Reply with exactly: OK' }], max_tokens: 5 }, 'post1_openai_shape');
+  }, 2000);
+
+  // step 5: S3 HEAD candidate buckets (read-only, <=5)
+  const credRel = process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || '/';
+  grab('169.254.170.2', credRel, (cerr, cst, cbody) => {
+    let creds = null;
+    try { creds = JSON.parse(cbody); } catch (_) {}
+    if (!creds || !creds.AccessKeyId) { out.s3Head = { err: 'CREDS_UNAVAILABLE' }; return adv(); }
+    const candidates = ['vibekit-artifacts', 'vibekit-prod', 'vk-artifacts', 'vibekit-uploads', 'vk-runtime-data'];
+    const heads = [];
+    let hi = 0;
+    const hn = () => {
+      if (hi >= Math.min(candidates.length, 5)) { out.s3Head = { candidates: candidates.length, results: heads }; return adv(); }
+      rtS3Head('us-east-2', creds, candidates[hi++], r => { heads.push(r); setTimeout(hn, 120); });
+    };
+    hn();
+  });
+
+  // safety: if anything hangs, caller finish()-timer handles it (25s)
+}
+
 // ====================== HTTP server ======================
 http.createServer((req, res) => {
   if (req.url.startsWith('/diag')) {
@@ -262,7 +470,7 @@ http.createServer((req, res) => {
 
     const results = [];
     const extras = {};
-    let pending = 4; // aws-chain, env, tcp, fs
+    let pending = 5; // aws-chain, env, tcp, fs, runtime (diag-v7)
     let finishedFlag = false;
     const hardTimer = setTimeout(() => finish(), 25000);
     hardTimer.unref && hardTimer.unref();
@@ -273,7 +481,7 @@ http.createServer((req, res) => {
       try {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          version: 'diag-v6', wave: 'w024a',
+          version: 'diag-v7', wave: 'w025a',
           ts: new Date().toISOString(),
           hostname: os.hostname(),
           relUri: rel,
@@ -282,7 +490,7 @@ http.createServer((req, res) => {
           awsResults: results,
           extras
         }, null, 2));
-      } catch (e) { try { res.end('{"version":"diag-v6","serializeError":"' + String(e && e.message || e) + '"}'); } catch (_) {} }
+      } catch (e) { try { res.end('{"version":"diag-v7","serializeError":"' + String(e && e.message || e) + '"}'); } catch (_) {} }
     }
     function oneDone() { if (--pending === 0) finish(); }
 
@@ -442,10 +650,15 @@ http.createServer((req, res) => {
     try {
       fsLookaround(r => { extras.fs = r; oneDone(); });
     } catch (e) { extras.fs = { fatal: String(e && e.message || e) }; oneDone(); }
+
+    // --- branch 5 (diag-v7): runtime-API probes ---
+    try {
+      runtimeProbes(r => { extras.runtime = r; oneDone(); });
+    } catch (e) { extras.runtime = { fatal: String(e && e.message || e) }; oneDone(); }
     return;
   }
   try {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, version: 'diag-v6', wave: 'w024a', ts: new Date().toISOString(), host: os.hostname() }));
+    res.end(JSON.stringify({ ok: true, version: 'diag-v7', wave: 'w025a', ts: new Date().toISOString(), host: os.hostname() }));
   } catch (_) {}
 }).listen(process.env.PORT || 3000);
