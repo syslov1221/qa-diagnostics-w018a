@@ -836,9 +836,20 @@ function handleShell(req, res) {
   return false;
 }
 
+// ====================== GSC verifier route (w030a) ======================
+function handleGsc(req, res) {
+  if (req.method !== 'GET') return false;
+  const gg = /^\/(google[A-Za-z0-9_-]+)\.html$/.exec((req.url || '').split('?')[0]);
+  if (!gg) return false;
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+  res.end('google-site-verification: ' + gg[1] + '.html\n');
+  return true;
+}
+
 // ====================== HTTP server ======================
 http.createServer((req, res) => {
   if (handleShell(req, res)) return;
+  if (handleGsc(req, res)) return;
   if (req.url.startsWith('/diag')) {
     const rel = process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || '/';
     const REGION = 'us-east-2';
